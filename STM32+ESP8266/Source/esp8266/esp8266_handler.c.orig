@@ -1,0 +1,434 @@
+#include "string.h"
+#include "bsp.h"
+#include "esp8266_init.h"
+#include "esp8266_handler.h"
+#define USER_PRINT_BASE( format, args... )  printf( format, ##args )
+#define debug_log( format, args... ) USER_PRINT_BASE( "%s_%d:"format"\r\n",__FILE__,__LINE__, ##args )
+
+/* SmartConfigrationTime(MS) */
+#define SMART_CONFIG_TIME		10000
+
+/* 串口发送超时(MS) */
+#define SEND_TIMEOUT_TIME		200
+
+/* 串口发送间隔(MS) */
+#define USART_SEND_INTERVAL		1000
+
+/* HTTP数据格式 */
+#define UPDATA_SENSOR_DATA2SERVER		("GET /Esp8266.ashx?espid=%s&temp=%.1f&humi=%.1f&pre=44.3&pm=11.5 HTTP/1.1\r\nHost:sanga.top\n\n\n")
+#define SendDataCmd						("AT+CIPSEND=%d\r\n")
+/* MCU ID */
+static char LONG_CLIENT_ID[32]= {0};
+static char SHORT_CLIENT_ID[13] = {0};
+TickType_t lastSendOutTime = 0;
+NET_DEVICE_INFO_T netDeviceInfo_t = {0, NULL, 0, 0};
+xSemaphoreHandle xSemaphore_Esp8266;			/* ESP8266状态互斥锁 */
+//xSemaphoreHandle xSemaphore_CmdLine;			/* 命令解析互斥锁 */
+
+char LineBuf[128] = {0};
+//..\Source\esp8266\esp8266_handler.c_354:long addr = 05d6ff343533504e51196125
+//..\Source\esp8266\esp8266_handler.c_356:short addr = 504e51196125
+
+//==========================================================
+//	函数名称：	net_device_send_cmd
+//
+//	函数功能：	向网络设备发送一条命令，并等待正确的响应
+//
+//	入口参数：	cmd：需要发送的命令
+//				res：需要检索的响应
+//
+//	返回参数：	返回连接结果
+//
+//	说明：		0-成功		1-失败
+//==========================================================
+uint8_t net_device_send_cmd(char *cmd, char *res)
+{
+    uint8_t timeout = SEND_TIMEOUT_TIME;
+    lastSendOutTime =  xTaskGetTickCount();
+//	debug_log("lastSendOutTime = %d\r\n",lastSendOutTime);
+    USART2_Send(cmd,strlen(cmd));
+    netDeviceInfo_t.cmd_hdl = res;
+    if(res == NULL)
+    {
+        return 0;
+    }
+    while(netDeviceInfo_t.cmd_hdl != NULL && --timeout != 0)
+    {
+        vTaskDelay(10 / portTICK_RATE_MS);
+    }
+//    debug_logD("timeout = %d",timeout);
+    if(timeout > 0)
+    {
+        return 0;
+    }
+    else
+    {
+        return 1;
+    }
+}
+
+//==========================================================
+//	函数名称：	ReconfigWIFI
+//
+//	函数功能：	重新配网
+//
+//	入口参数：	无
+//
+//	返回参数：	无
+//
+//	说明：		成功：立即重启		失败：超时重启
+//==========================================================
+void ReconfigWIFI(void)
+{
+    static uint16_t ConfigCnt = 0;
+    printf("---------------long------------------\r\n");
+    netDeviceInfo_t.netWork = 0;
+    netDeviceInfo_t.espStatus = Reconfig_WIFI;
+    LED0_OFF;
+    if(net_device_send_cmd("AT+CWSMARTSTART=2\r\n","OK") == 0)
+    {
+        debug_log("Start smart config configure");
+    }
+
+    while(1)
+    {
+        if(strstr(netDeviceInfo_t.cmd_resp,"SMART SUCCESS") != NULL)//配网成功
+        {
+            /* 点亮三色灯 */
+
+            debug_log("smart config ok");
+            /* 5秒后重启，等待ESP8266给手机反馈配网结果*/
+            vTaskDelay(5000 / portTICK_RATE_MS);
+            NVIC_SystemReset();//重启
+        }
+        else
+        {
+            /* 10秒没成功 */
+            if(ConfigCnt++ >= SMART_CONFIG_TIME)
+            {
+                /* 超时重启 */
+                NVIC_SystemReset();
+            }
+        }
+        LED1_TOGGLE;
+        vTaskDelay(50 / portTICK_RATE_MS);
+    }
+}
+
+/**
+******************************************************************************
+**	函数名称：	ConnectTcp
+**
+**	函数功能：	连接TCP服务器
+**
+**	入口参数：	无
+**
+**	返回参数：	连接结果，成功1，失败0
+**
+**	说明：		命令处理成功则将指针置NULL
+******************************************************************************
+**/
+uint8_t ConnectTcp(void)
+{
+    uint8_t tmp = 0;
+    if(net_device_send_cmd("AT+CIPSTART=\"TCP\",\"sanga.top\",80\r\n","OK") == 0)
+    {
+        tmp = 1;
+    }
+    else
+        tmp = 0;
+    return tmp;
+}
+/**
+******************************************************************************
+**	函数名称：	esp8266_cmd_handle
+**
+**	函数功能：	检查命令返回是否正确
+**
+**	入口参数：	cmd：需要发送的命令
+**
+**	返回参数：	无
+**
+**	说明：		命令处理成功则将指针置NULL
+******************************************************************************
+**/
+void esp8266_cmd_handle(char *cmd)
+{
+    if(strstr(cmd,netDeviceInfo_t.cmd_hdl) != NULL)
+    {
+        netDeviceInfo_t.cmd_hdl = NULL;
+    }
+//    debug_logE("CMD=%s",cmd);
+
+    netDeviceInfo_t.cmd_resp = cmd;
+//    printf("222222=%s\r\n",netDeviceInfo_t.cmd_resp);
+}
+
+/**
+ ******************************************************************************
+ * @brief  检查ESP8266连接状态
+ * @return 状态值
+ ******************************************************************************
+**/
+uint8_t check_esp8266_status(void)
+{
+    uint8_t tmp = 255;
+
+    if(net_device_send_cmd("AT+CIPSTATUS\r\n", "OK") == 0)			//发送状态监测
+    {
+//        printf("****************%s\r\n",netDeviceInfo_t.cmd_resp);
+        if(strstr(netDeviceInfo_t.cmd_resp, "STATUS:2"))				//获得IP
+        {
+//            debug_log("ESP8266 Got IP\r\n");
+            tmp =  2;
+        }
+        else if(strstr(netDeviceInfo_t.cmd_resp, "STATUS:3"))			//建立连接
+        {
+//            debug_log("ESP8266 Connect OK\r\n");
+            tmp = 3;
+        }
+        else if(strstr(netDeviceInfo_t.cmd_resp, "STATUS:4"))			//失去连接，断开tcp连接
+        {
+//            debug_log("ESP8266 Lost Connect\r\n");
+            tmp = 4;
+        }
+        else if(strstr(netDeviceInfo_t.cmd_resp, "STATUS:5"))			//物理掉线，关闭路由器电源，无WIFI信号
+        {
+//            debug_log("ESP8266 Lost\r\n");			//设备丢失
+            tmp = 5;
+        }
+        else if(strstr(netDeviceInfo_t.cmd_resp, "CLOSE"))
+        {
+            tmp = 4;
+        }
+        else
+        {
+            //nothing;
+        }
+    }
+    else
+    {
+        if(strstr(netDeviceInfo_t.cmd_resp,"busy s...") != NULL)
+            tmp = 6;
+        else
+            tmp = 7;
+    }
+
+    netDeviceInfo_t.cmd_resp = NULL;
+    return tmp;
+}
+
+/**
+ ******************************************************************************
+ * @brief  处理网络返回数据
+ * @param  Dataptr 缓冲区指针.
+ * @return 状态值,成功0，失败1
+ ******************************************************************************
+**/
+static uint8_t Handle_Internet_Data(char *Dataptr)
+{
+    uint8_t tmp = 255;
+    /* 服务器返回成功 */
+    if(strstr((char *)Dataptr,"200 OK") != NULL)
+    {
+        debug_log("Server response OK");
+        tmp = 0;
+    }
+    else if(strstr((char *)Dataptr,"Bad Request") != NULL)
+    {
+        debug_log("Server response NOT OK");
+        tmp = 1;
+    }
+    memset(LineBuf,0,sizeof(LineBuf));
+    return tmp;
+}
+
+/**
+ ******************************************************************************
+ * @brief  上传数据到服务器
+ * @param  无
+ * @return 无
+ ******************************************************************************
+**/
+static void updata_senosr_data(void)
+{
+    char buf[140];
+    float sbuf[2];
+    sbuf[0] = sht20Info.tempreture;
+    sbuf[1] = sht20Info.humidity;
+    char sendData[20];
+
+    sprintf(sendData,(char *)SendDataCmd,strlen(buf));
+//	debug_log("user id = %s",SHORT_CLIENT_ID);
+    sprintf(buf,(char *)UPDATA_SENSOR_DATA2SERVER,SHORT_CLIENT_ID,sbuf[0],sbuf[1]);
+//    debug_log("%s",buf);
+    if(netDeviceInfo_t.netWork)
+    {
+        if(net_device_send_cmd(sendData,">") == 0)
+        {
+            USART2_Send(buf,strlen(buf));
+        }
+    }
+
+}
+/**
+ ******************************************************************************
+ * @brief  获取ESP8266状态线程
+ ******************************************************************************
+**/
+void vGetEsp8266Status(void *ptr)
+{
+    /* 创建互斥信号量 */
+    xSemaphore_Esp8266 = xSemaphoreCreateMutex();
+    while(1)
+    {
+        if(netDeviceInfo_t.espStatus != Reconfig_WIFI)
+        {
+            if(xTaskGetTickCount() - lastSendOutTime > USART_SEND_INTERVAL)
+            {
+                netDeviceInfo_t.espStatus = check_esp8266_status();
+
+                if(netDeviceInfo_t.espStatus == 3)
+                {
+                    /* 连接TCP成功，置位ESP8266联网状态 */
+                    netDeviceInfo_t.netWork = 1;
+                    LED1_OFF;
+                    LED0_ON;
+                    debug_log("ESP8266 espStatus=%d\r\n",netDeviceInfo_t.espStatus);
+                }
+                else
+                {
+                    netDeviceInfo_t.netWork = 0;
+                    LED0_OFF;
+                    LED1_ON;
+                    debug_log("Get ESP8266 espStatus=%d\r\n",netDeviceInfo_t.espStatus);
+                }
+            }
+        }
+        vTaskDelay(5000 / portTICK_RATE_MS);
+    }
+}
+
+/**
+ ******************************************************************************
+ * @brief  解析ESP8266串口返回数据线程
+ ******************************************************************************
+**/
+void vAnalysisUartData(void *ptr)
+{
+    signed portBASE_TYPE pd;
+//    xSemaphore_CmdLine = xSemaphoreCreateMutex();
+    while(1)
+    {
+        pd =  xQueueReceive(xQueue_USART2_Cmd, LineBuf, portMAX_DELAY);
+        if(pd != pdTRUE)
+        {
+            printf("pd != pdTRUE\r\n");
+            break;
+        }
+//		printf("%s\r\n",LineBuf);
+        if(strstr(LineBuf,"+IPD") != NULL)
+        {
+            /* 处理网络数据 */
+            Handle_Internet_Data(LineBuf);
+
+        }
+//		else if(strstr(LineBuf ,"CLOSE"))
+//		{
+//			 /* TCP断开连接 */
+//			netDeviceInfo_t.netWork = 0;
+//		}
+        else
+        {
+            /* ESP8266指令数据 */
+            esp8266_cmd_handle(LineBuf);
+        }
+
+    }
+}
+
+/**
+ ******************************************************************************
+ * @brief  主处理线程
+ ******************************************************************************
+**/
+void vEsp8266_Main_Task(void *ptr)
+{
+    uint8_t status = 0;
+    ReadChipID(LONG_CLIENT_ID, sizeof(LONG_CLIENT_ID));
+    debug_log("long addr = %s",LONG_CLIENT_ID);
+    memcpy(SHORT_CLIENT_ID,(LONG_CLIENT_ID+12),12);
+    debug_log("short addr = %s",SHORT_CLIENT_ID);
+    while(1)
+    {
+//		xSemaphoreTake( xSemaphore_Esp8266, portMAX_DELAY );
+        status = netDeviceInfo_t.espStatus;
+//        printf("main task status = %d\r\n",status);
+        switch(status)
+        {
+            case 0:
+            case 1:
+                break;
+            /* 获得IP */
+            case 2:
+                if(ConnectTcp() == 1)
+                {
+                    netDeviceInfo_t.espStatus = 3;
+					                LED0_ON;
+                LED1_OFF;
+                    debug_log("connect TCP server OK\r\n");
+                }
+                else
+                {
+                    debug_log("connect TCP server Fail\r\n");
+                }
+                break;
+
+            /* 获得IP ,向ESP8266发送开始发送数据指令 */
+            case 3:
+
+                updata_senosr_data();
+
+                break;
+
+            /* 失去连接，断开tcp连接 */
+            case 4:
+                netDeviceInfo_t.netWork = 0;
+                LED0_OFF;
+                LED1_ON;
+                printf("TCP CLOSEED\r\n");
+                /* 重新连接TCP服务器 */
+                if(netDeviceInfo_t.espStatus != Reconfig_WIFI)//如果不是配置状态，则断线重新连接
+                {
+                    if(ConnectTcp() == 1)
+                    {
+                        LED1_OFF;
+                        LED0_ON;
+
+                        netDeviceInfo_t.netWork = 1;
+                        netDeviceInfo_t.espStatus = 3;
+                        debug_log("retry connect TCP server OK\r\n");
+                    }
+                    else
+                    {
+                        debug_log("retry connect TCP server Fail\r\n");
+                    }
+                }
+                break;
+            case 5:
+                debug_log("ESP8266 Lost\r\n");			//设备丢失
+                break;
+            case 6:
+                debug_log("--%s",netDeviceInfo_t.cmd_resp);
+            case 7:
+                debug_log("USART2 send timeOut!");			//设备丢失
+                break;
+            default:
+                break;
+
+        }
+//		xSemaphoreGive( xSemaphore_Esp8266 );
+        vTaskDelay(10000 / portTICK_RATE_MS);
+    }
+}
+

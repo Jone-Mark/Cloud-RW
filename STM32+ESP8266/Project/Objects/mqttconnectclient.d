@@ -1,0 +1,12 @@
+.\objects\mqttconnectclient.o: ..\Source\MQTTPacket\src\MQTTConnectClient.c
+.\objects\mqttconnectclient.o: ..\Source\MQTTPacket\src\MQTTPacket.h
+.\objects\mqttconnectclient.o: E:\MDK5\ARM\ARMCC\Bin\..\include\stdint.h
+.\objects\mqttconnectclient.o: ..\Source\MQTTPacket\src\MQTTConnect.h
+.\objects\mqttconnectclient.o: ..\Source\MQTTPacket\src\MQTTPublish.h
+.\objects\mqttconnectclient.o: ..\Source\MQTTPacket\src\MQTTSubscribe.h
+.\objects\mqttconnectclient.o: ..\Source\MQTTPacket\src\MQTTUnsubscribe.h
+.\objects\mqttconnectclient.o: ..\Source\MQTTPacket\src\MQTTFormat.h
+.\objects\mqttconnectclient.o: ..\Source\MQTTPacket\src\StackTrace.h
+.\objects\mqttconnectclient.o: E:\MDK5\ARM\ARMCC\Bin\..\include\stdio.h
+.\objects\mqttconnectclient.o: ..\Source\MQTTPacket\src\MQTTPacket.h
+.\objects\mqttconnectclient.o: E:\MDK5\ARM\ARMCC\Bin\..\include\string.h
